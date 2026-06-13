@@ -19,10 +19,9 @@ sources:
     search_template: "https://yandex.com/search/?text={query}&lr=134"
 
   - name: github
-    type: edge_mcp
+    type: api
     priority: 1
     categories: [ai, tech]
-    search_template: "https://github.com/search?q={query}&type=code"
 
   # Tier B: 中文社区（需要登录的走 Edge MCP）
   - name: zhihu
@@ -86,6 +85,11 @@ sources:
     search_template: "http://www.stats.gov.cn/sj/zxfb/search?keyword={query}"
 
   # Tier F: Direct API sources (no browser needed)
+  - name: reddit
+    type: api
+    priority: 1
+    categories: [general, tech, ai, investment]
+
   - name: hacker_news
     type: api
     priority: 2
@@ -143,10 +147,9 @@ sources:
 
   # Video sources (tech tutorials, project demos, architecture walkthroughs)
   - name: youtube
-    type: edge_mcp
+    type: api
     priority: 2
     categories: [tech, ai, general]
-    search_template: "https://www.youtube.com/results?search_query={query}"
 
   - name: bilibili
     type: edge_mcp

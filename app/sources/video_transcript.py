@@ -1,14 +1,183 @@
 import asyncio
+import json
 import logging
+import math
 import os
 import re
 import tempfile
+from datetime import datetime, timezone
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 # Path to Python that has yt-dlp installed
 _YT_DLP_PYTHON = os.getenv('YT_DLP_PYTHON', 'D:/tools/anaconda/python.exe')
+
+
+# ---------------------------------------------------------------------------
+# YouTube search via yt-dlp — structured JSON, no browser needed
+# ---------------------------------------------------------------------------
+
+
+def _extract_core_subject(topic: str) -> str:
+    """Strip noise words from query for cleaner YouTube search."""
+    noise = [
+        "what are the", "what is the", "what is", "what are",
+        "how to", "how do", "how does", "why does", "why do",
+        "tell me about", "latest", "recent", "best", "top",
+        "please", "explain", "compare", "difference between",
+    ]
+    text = topic.lower().strip().rstrip("?!.")
+    for w in sorted(noise, key=len, reverse=True):
+        if text.startswith(w):
+            text = text[len(w):].strip()
+            break
+    # Cap at 6 words — YouTube search degrades with long queries
+    words = text.split()
+    if len(words) > 6:
+        text = " ".join(words[:6])
+    return text
+
+
+async def search_youtube_ytdlp(query: str, max_results: int = 10) -> list[dict]:
+    """Search YouTube via yt-dlp, return structured video metadata.
+
+    Uses yt-dlp --dump-json ytsearchN:query for full metadata
+    (views, likes, upload date, channel, duration, description).
+
+    Args:
+        query: Search query
+        max_results: Max videos to return
+
+    Returns:
+        List of dicts with title, url, channel, views, likes,
+        comments, duration, description, upload_date
+    """
+    core = _extract_core_subject(query)
+    try:
+        cmd = [
+            _YT_DLP_PYTHON, "-m", "yt_dlp",
+            "--ignore-config",
+            "--no-cookies-from-browser",
+            f"ytsearch{max_results}:{core}",
+            "--dump-json",
+            "--no-warnings",
+            "--no-download",
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+
+        if proc.returncode != 0:
+            logger.debug(f"yt-dlp search failed: {stderr.decode('utf-8', errors='replace')[:200]}")
+            return []
+
+        videos = []
+        for line in stdout.decode("utf-8", errors="replace").strip().split("\n"):
+            if not line.strip():
+                continue
+            try:
+                v = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            video_id = v.get("id", "")
+            if not video_id:
+                continue
+
+            # Parse upload date
+            upload_date = v.get("upload_date", "")  # YYYYMMDD
+            date_str = ""
+            if upload_date and len(upload_date) == 8:
+                try:
+                    date_str = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:8]}"
+                except (ValueError, IndexError):
+                    pass
+
+            # Parse duration
+            duration_s = v.get("duration", 0)
+            duration_str = ""
+            if duration_s:
+                mins = int(duration_s) // 60
+                secs = int(duration_s) % 60
+                duration_str = f"{mins}:{secs:02d}"
+
+            videos.append({
+                "title": v.get("title", ""),
+                "url": v.get("webpage_url", f"https://www.youtube.com/watch?v={video_id}"),
+                "video_id": video_id,
+                "channel": v.get("channel", v.get("uploader", "")),
+                "views": int(v.get("view_count", 0) or 0),
+                "likes": int(v.get("like_count", 0) or 0),
+                "comments": int(v.get("comment_count", 0) or 0),
+                "duration": duration_str,
+                "description": (v.get("description", "") or "")[:500],
+                "upload_date": date_str,
+            })
+
+        logger.info(f"youtube (yt-dlp): {len(videos)} results for '{core}'")
+        return videos
+
+    except asyncio.TimeoutError:
+        logger.debug(f"yt-dlp search timeout for '{core}'")
+        return []
+    except Exception as e:
+        logger.debug(f"yt-dlp search error: {e}")
+        return []
+
+
+def extract_transcript_highlights(transcript: str, topic: str, limit: int = 5) -> list[str]:
+    """Extract quotable highlights from a transcript.
+
+    Filters filler (subscribe, welcome back, etc.), scores sentences by
+    specificity (numbers, proper nouns, topic relevance), returns top N.
+    """
+    if not transcript:
+        return []
+
+    sentences = re.split(r'(?<=[.!?])\s+', transcript)
+
+    # Fallback for punctuation-free transcripts
+    if len(sentences) <= 1 and len(transcript.split()) > 50:
+        words = transcript.split()
+        sentences = [' '.join(words[i:i+20]) for i in range(0, len(words), 20)]
+
+    filler = [
+        r"^(hey |hi |what's up|welcome back|in today's video|don't forget to)",
+        r"(subscribe|like and comment|hit the bell|check out the link|down below)",
+        r"^(so |and |but |okay |alright |um |uh )",
+        r"(thanks for watching|see you (next|in the)|bye)",
+    ]
+
+    topic_words = [w.lower() for w in topic.lower().split() if len(w) > 2]
+
+    candidates = []
+    for sent in sentences:
+        sent = sent.strip()
+        words = sent.split()
+        if len(words) < 8 or len(words) > 50:
+            continue
+        if any(re.search(p, sent, re.IGNORECASE) for p in filler):
+            continue
+
+        score = 0
+        if re.search(r'\d', sent):
+            score += 2
+        if re.search(r'[A-Z][a-z]+', sent):
+            score += 1
+        if '?' in sent:
+            score += 1
+        sent_lower = sent.lower()
+        if any(w in sent_lower for w in topic_words):
+            score += 2
+
+        candidates.append((score, sent))
+
+    candidates.sort(key=lambda x: -x[0])
+    return [sent for _, sent in candidates[:limit]]
 
 
 def _parse_vtt_text(vtt_content: str) -> str:

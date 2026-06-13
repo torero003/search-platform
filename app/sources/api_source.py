@@ -1,19 +1,24 @@
 """Direct API-based sources (no browser automation needed).
 
-Covers: Hacker News, GitHub Trending, RSSHub, Yahoo Finance,
-CoinGecko, Binance, Fear&Greed, World Bank, SEC EDGAR, cninfo, v2ex.
+Covers: Hacker News (Algolia), GitHub (Search API), YouTube (yt-dlp),
+GitHub Trending, RSSHub, Yahoo Finance, CoinGecko, Binance, Fear&Greed,
+World Bank, SEC EDGAR, cninfo, v2ex, Reddit.
 """
 
 import asyncio
 import json
 import logging
+import math
 import os
+import re
 import time
-from urllib.parse import quote
+from datetime import datetime, timezone
+from urllib.parse import quote, urlencode
 
 import httpx
 
 from app.sources.base import BaseSource, SearchResult
+from app.sources.reddit_source import RedditSource
 
 logger = logging.getLogger(__name__)
 
@@ -36,51 +41,162 @@ def _make_client(timeout=15.0, **kwargs):
     return httpx.AsyncClient(timeout=timeout, **kwargs)
 
 # ---------------------------------------------------------------------------
-# Hacker News
+# Hacker News — Algolia API (full-text search, date filter, comments)
 # ---------------------------------------------------------------------------
+
+_ALGOLIA_SEARCH_URL = "https://hn.algolia.com/api/v1/search"
+_ALGOLIA_ITEM_URL = "https://hn.algolia.com/api/v1/items"
+
+
+def _hn_flatten_query(text: str) -> str:
+    """Normalize query for Algolia — flatten hyphens/commas to spaces."""
+    return " ".join(text.replace(",", " ").replace("-", " ").split())
+
+
+def _hn_extract_core(topic: str) -> str:
+    """Strip common noise prefixes from HN query."""
+    import re
+    text = re.sub(
+        r"^(what are the|what is the|what is|what are|tell me about|latest|recent|best|top)\s+",
+        "", topic.lower().strip().rstrip("?!."), count=1,
+    )
+    words = text.split()
+    if len(words) > 6:
+        text = " ".join(words[:6])
+    return text
 
 
 async def search_hacker_news(query: str, max_results: int = 10) -> list[SearchResult]:
-    """Search Hacker News via Firebase API + best-of HN search."""
+    """Search Hacker News via Algolia API — full-text search with date filter."""
     results = []
     try:
-        # Step 1: Get top story IDs
-        async with _make_client(timeout=10.0) as client:
-            resp = await client.get("https://hacker-news.firebaseio.com/v0/topstories.json")
-            story_ids = resp.json()[:100]  # top 100
+        core = _hn_flatten_query(_hn_extract_core(query))
+        tokens = core.split()
 
-        # Step 2: Fetch story details
-        fetch_tasks = []
-        for sid in story_ids[:50]:
-            fetch_tasks.append(_fetch_hn_story(sid))
-        stories = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+        # Build Algolia params
+        params = {
+            "query": core,
+            "tags": "story",
+            "numericFilters": "points>2",
+            "hitsPerPage": str(min(max_results * 2, 40)),
+        }
+        # Algolia defaults to AND matching — mark all-but-first token as optional
+        if len(tokens) > 1:
+            params["optionalWords"] = " ".join(tokens[1:])
 
-        for story in stories:
-            if isinstance(story, Exception):
-                continue
-            if not story:
-                continue
-            # Filter by query keywords
-            text = f"{story.get('title', '')} {story.get('text', '')}".lower()
-            if any(kw in text for kw in query.lower().split()) or not query:
-                results.append(SearchResult(
-                    title=story["title"],
-                    url=story.get("url", story["hn_url"]),
-                    content=(story.get("text", "") or "")[:400],
-                    source="hacker_news",
-                    score=story.get("score", 0),
-                    published_date=story.get("date", ""),
-                    engagement={
-                        "upvotes": story.get("score", 0),
-                        "comments": story.get("descendants", 0),
-                    },
-                ))
-            if len(results) >= max_results:
-                break
+        from urllib.parse import urlencode
+        url = f"{_ALGOLIA_SEARCH_URL}?{urlencode(params)}"
+
+        async with _make_client(timeout=15.0) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+
+        hits = data.get("hits", [])
+        for hit in hits[:max_results]:
+            story_url = hit.get("url", "") or f"https://news.ycombinator.com/item?id={hit.get('objectID')}"
+            title = hit.get("title", "")
+            # Strip HN prefixes for cleaner display
+            clean_title = re.sub(r"^(Tell HN|Show HN|Ask HN|Launch HN)\s*:\s*", "", title)
+            created = hit.get("created_at_i", 0)
+            date_str = ""
+            if created:
+                try:
+                    date_str = datetime.fromtimestamp(created, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+                except (ValueError, TypeError, OSError):
+                    pass
+
+            results.append(SearchResult(
+                title=clean_title,
+                url=story_url,
+                content=hit.get("story_text", "")[:400] if hit.get("story_text") else "",
+                source="hacker_news",
+                score=hit.get("points", 0),
+                published_date=date_str,
+                engagement={
+                    "upvotes": hit.get("points", 0),
+                    "comments": hit.get("num_comments", 0),
+                },
+            ))
+
+        # Enrich top results with comments
+        for result in results[:min(3, len(results))]:
+            comment_text = await _fetch_hn_top_comments(result.url, result.title)
+            if comment_text and not result.content:
+                result.content = comment_text[:400]
+
     except Exception as e:
         logger.error(f"hacker_news search error: {e}")
 
     return results[:max_results]
+
+
+async def _fetch_hn_top_comments(story_url: str, title: str) -> str | None:
+    """Fetch top comments for an HN story via Algolia items API."""
+    import re
+    m = re.search(r"id=(\d+)", story_url)
+    if not m:
+        return None
+    story_id = m.group(1)
+    try:
+        async with _make_client(timeout=8.0) as client:
+            resp = await client.get(
+                f"{_ALGOLIA_ITEM_URL}/search",
+                params={
+                    "query": "",
+                    "tags": "comment",
+                    "numericFilters": f"parent_story_id_i={story_id},points>3",
+                    "sortBy": "points:desc",
+                    "hitsPerPage": 3,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        comments = data.get("hits", [])
+        if not comments:
+            return None
+
+        lines = []
+        for c in comments[:3]:
+            content = c.get("content", "")
+            # Strip HTML
+            content = re.sub(r"<[^>]+>", " ", content)
+            content = re.sub(r"\s+", " ", content).strip()
+            # Take first sentence
+            sentences = re.split(r"(?<=[.!?])\s+", content)
+            if sentences:
+                first = sentences[0][:200]
+                author = c.get("author", "")
+                lines.append(f"{author}: {first}" if author else first)
+
+        return " | ".join(lines) if lines else None
+    except Exception:
+        return None
+
+
+async def _fetch_hn_story(story_id: int) -> dict | None:
+    """Legacy Firebase fetcher — kept for backward compatibility."""
+    try:
+        async with _make_client(timeout=5.0) as client:
+            resp = await client.get(f"https://hacker-news.firebaseio.com/v0/item/{story_id}.json")
+            item = resp.json()
+        if not item or not item.get("title"):
+            return None
+        from datetime import datetime, timezone
+        ts = item.get("time", 0)
+        date = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if ts else ""
+        return {
+            "title": item.get("title", ""),
+            "url": item.get("url", ""),
+            "text": item.get("text", "").strip() if item.get("type") == "story" else "",
+            "hn_url": f"https://news.ycombinator.com/item?id={story_id}",
+            "score": item.get("score", 0),
+            "descendants": item.get("descendants", 0),
+            "date": date,
+        }
+    except Exception:
+        return None
 
 
 async def _fetch_hn_story(story_id: int) -> dict | None:
@@ -1041,15 +1157,202 @@ class SogouWechatSource(BaseSource):
 
 
 # ---------------------------------------------------------------------------
+# YouTube — yt-dlp search (structured JSON, no browser needed)
+# ---------------------------------------------------------------------------
+
+_YT_DLP_PYTHON = os.getenv("YT_DLP_PYTHON", "D:/tools/anaconda/python.exe")
+
+
+async def search_youtube(query: str, max_results: int = 10) -> list[SearchResult]:
+    """Search YouTube via yt-dlp — structured metadata with engagement data."""
+    try:
+        from app.sources.video_transcript import search_youtube_ytdlp
+        videos = await search_youtube_ytdlp(query, max_results)
+        results = []
+        for v in videos:
+            content_parts = [
+                f"Channel: {v.get('channel', '')}",
+                f"Duration: {v.get('duration', '')}",
+                f"Views: {v.get('views', 0):,}",
+                f"Uploaded: {v.get('upload_date', '')}",
+            ]
+            desc = (v.get("description", "") or "")[:500]
+            if desc:
+                content_parts.append(desc)
+            results.append(SearchResult(
+                title=v.get("title", ""),
+                url=v.get("url", ""),
+                content=" | ".join(content_parts),
+                source="youtube",
+                score=v.get("views", 0),
+                published_date=v.get("upload_date", ""),
+                engagement={
+                    "views": v.get("views", 0),
+                    "likes": v.get("likes", 0),
+                    "comments": v.get("comments", 0),
+                },
+            ))
+        logger.info(f"youtube (yt-dlp): {len(results)} results")
+        return results
+    except ImportError:
+        logger.warning("youtube: video_transcript module not available")
+        return []
+    except Exception as e:
+        logger.error(f"youtube search error: {e}")
+        return []
+
+
+class YouTubeSource(BaseSource):
+    async def search(self, query: str, max_results: int = 10) -> list[SearchResult]:
+        return await search_youtube(query, max_results)
+
+    def health_check(self) -> dict:
+        return {"available": True, "message": "YouTube yt-dlp ready"}
+
+
+# ---------------------------------------------------------------------------
+# GitHub — Search API (issues/PRs, structured JSON)
+# ---------------------------------------------------------------------------
+
+
+def _github_resolve_token() -> str | None:
+    """Resolve GitHub token from env or gh CLI."""
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        return token
+    # Fallback: memory-stored token
+    try:
+        import pathlib
+        mem_file = pathlib.Path(os.environ.get("USERPROFILE", "")) / ".claude/projects/C--Users-win/memory/github_token.md"
+        if mem_file.exists:
+            content = mem_file.read_text(encoding="utf-8")
+            m = re.search(r"`(ghp_[A-Za-z0-9]{36,})`", content)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    # Fallback: gh CLI
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["gh", "auth", "token"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return None
+
+
+async def search_github(query: str, max_results: int = 10) -> list[SearchResult]:
+    """Search GitHub Issues and PRs via Search API."""
+    results = []
+    try:
+        core = query.lower().strip().rstrip("?!.")
+        # Strip noise words
+        for w in sorted([
+            "what are the", "what is the", "what is", "what are",
+            "tell me about", "latest", "recent", "best", "top",
+        ], key=len, reverse=True):
+            if core.startswith(w):
+                core = core[len(w):].strip()
+                break
+        words = core.split()
+        if len(words) > 6:
+            core = " ".join(words[:6])
+
+        token = _github_resolve_token()
+        headers = {
+            "User-Agent": "datasearch-platform/1.0",
+            "Accept": "application/vnd.github+json",
+        }
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        q = f"{core} created:>2025-01-01"
+        params = {
+            "q": q,
+            "sort": "reactions",
+            "order": "desc",
+            "per_page": str(min(max_results * 2, 100)),
+        }
+        url = f"https://api.github.com/search/issues?{urlencode(params)}"
+
+        async with _make_client(timeout=15.0) as client:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+
+        items = data.get("items", [])
+        for item in items[:max_results]:
+            html_url = item.get("html_url", "")
+            title = item.get("title", "")
+            body = (item.get("body") or "")[:400]
+            reactions = item.get("reactions", {}).get("total_count", 0) if isinstance(item.get("reactions"), dict) else 0
+            comments = item.get("comments", 0)
+            labels = [l.get("name", "") for l in (item.get("labels") or []) if isinstance(l, dict)]
+            author = item.get("user", {}).get("login", "") if isinstance(item.get("user"), dict) else ""
+            repo = item.get("repository_url", "")
+            if repo:
+                repo = repo.replace("https://api.github.com/repos/", "")
+
+            created = item.get("created_at", "")
+            date_str = ""
+            if created:
+                try:
+                    dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                    date_str = dt.strftime("%Y-%m-%d")
+                except (ValueError, TypeError):
+                    pass
+
+            content_parts = []
+            if body:
+                content_parts.append(body)
+            if labels:
+                content_parts.append(f"Labels: {', '.join(labels)}")
+            if author:
+                content_parts.append(f"by {author}")
+
+            results.append(SearchResult(
+                title=f"{repo} / {title}" if repo else title,
+                url=html_url,
+                content=" | ".join(content_parts),
+                source="github",
+                score=reactions,
+                published_date=date_str,
+                engagement={
+                    "reactions": reactions,
+                    "comments": comments,
+                },
+            ))
+
+        logger.info(f"github (API): {len(results)} results for '{core}'")
+    except Exception as e:
+        logger.error(f"github search error: {e}")
+
+    return results[:max_results]
+
+
+class GitHubSource(BaseSource):
+    async def search(self, query: str, max_results: int = 10) -> list[SearchResult]:
+        return await search_github(query, max_results)
+
+    def health_check(self) -> dict:
+        return {"available": True, "message": "GitHub Search API ready"}
+
+
+# ---------------------------------------------------------------------------
 # Source registry — maps source name to class
 # ---------------------------------------------------------------------------
-# Note: YouTube and Bilibili are CDP-based (edge_mcp type), not API sources.
-# Their extractors are in cdp_client.py as _js_youtube_extract() and _js_bilibili_extract().
 
 # ---------------------------------------------------------------------------
 API_SOURCE_MAP = {
     "hacker_news": HackerNewsSource,
+    "github": GitHubSource,
     "github_trending": GitHubTrendingSource,
+    "youtube": YouTubeSource,
+    "reddit": RedditSource,
     "rsshub": RSSHubSource,
     "yahoo_finance": YahooFinanceSource,
     "coingecko": CoinGeckoSource,
